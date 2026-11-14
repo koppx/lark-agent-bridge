@@ -1,0 +1,6 @@
+# 本地配置与运行态，别提交
+.env
+state/
+*.log
+__pycache__/
+*.pyc

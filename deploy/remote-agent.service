@@ -1,0 +1,23 @@
+[Unit]
+Description=Remote agent HTTP service (wraps claude -p)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 换成你的路径、仓库目录、token
+WorkingDirectory=/opt/lark-agent-bridge
+ExecStart=/usr/bin/python3 remote_agent_server.py \
+    --host 127.0.0.1 \
+    --port 8787 \
+    --token CHANGE_ME \
+    --workdir /srv/repo \
+    --command "claude -p --output-format json"
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

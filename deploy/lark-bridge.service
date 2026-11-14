@@ -1,0 +1,19 @@
+[Unit]
+Description=Lark agent bridge (Feishu <-> remote agent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 改成你的实际路径和用户
+WorkingDirectory=/opt/lark-agent-bridge
+ExecStart=/usr/bin/python3 -m bridge.app
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+# 日志里会带 open_id，注意别把日志暴露给无关人员
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
