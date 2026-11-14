@@ -19,6 +19,12 @@ flowchart LR
     end
 ```
 
+## 当前终端会话模式（`/lark agent on`）
+
+如果希望飞书任务进入已经打开的 Claude Code 对话，而不是另起 agent，使用 [当前会话部署说明](deploy/current-session.md)。这个模式通过 SQLite 队列和后台任务通知续接当前对话，不依赖 Channels，也不会运行并发 `--resume`。需要保持终端开启，并安装仓库提供的 [lark skill 模板](skills/lark/SKILL.md)。
+
+现有 HTTP/SSH/本地命令模式仍按下面的教程使用；两种模式不要同时处理同一机器人的任务。
+
 ## 一、选择部署教程
 
 本节目的：区分本机验证与服务器常驻运行，避免把任务发到错误的机器。
