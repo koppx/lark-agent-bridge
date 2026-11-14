@@ -5,14 +5,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# 换成你的路径、仓库目录、token
+# 按 deploy/server.md 替换用户；命令、工作目录和 token 从 .env 读取
+User=YOUR_SERVER_USER
 WorkingDirectory=/opt/lark-agent-bridge
-ExecStart=/usr/bin/python3 remote_agent_server.py \
+EnvironmentFile=/opt/lark-agent-bridge/.env
+ExecStart=/opt/lark-agent-bridge/.venv/bin/python remote_agent_server.py \
     --host 127.0.0.1 \
     --port 8787 \
-    --token CHANGE_ME \
-    --workdir /srv/repo \
-    --command "claude -p --output-format json"
+    --timeout 840
 Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=5

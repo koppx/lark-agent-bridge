@@ -5,9 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# 改成你的实际路径和用户
+# 按 deploy/server.md 替换用户；两个服务使用同一位已配置 Claude 的用户
+User=YOUR_SERVER_USER
 WorkingDirectory=/opt/lark-agent-bridge
-ExecStart=/usr/bin/python3 -m bridge.app
+EnvironmentFile=/opt/lark-agent-bridge/.env
+ExecStart=/opt/lark-agent-bridge/.venv/bin/python -m bridge.app --env /opt/lark-agent-bridge/.env
 Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=5

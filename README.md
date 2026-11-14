@@ -1,191 +1,115 @@
 # 飞书 ↔ 远端 agent 桥接
 
-在飞书里 @ 一个自建应用机器人 → 消息转给服务器上的 Claude（或任意 CLI）→ 干完把结果发回飞书。
+本节目的：说明消息如何到达服务器，以及该从哪份教程开始部署。
 
-```
-飞书群/单聊
-   │  @机器人 + 文本
-   ▼
-[长连接] bridge（WebSocket，无需公网 IP、无需域名、无需验签）
-   │  HTTP + Bearer Token
-   ▼
-remote_agent_server.py ── subprocess ──> claude -p（带 --resume 续会话）
-   │
-   └── 结果回传 ──> 飞书（分片发送）
-```
+在飞书里 `@机器人 + 任务描述`，服务器收到消息后调用 agent，执行结果再回复到飞书。你的电脑和服务器可以位于不同网络。
 
-已实现的行为：
-- 只认 @ 本机器人的消息；单聊直接触发
-- open_id 白名单，未授权直接拒并回显 open_id
-- 事件 3 秒内 ACK，任务丢线程池异步跑（先回「收到」，跑完再发结果）
-- 同会话串行（一次只跑一个任务）、跨会话并行
-- 会话续接：`chat_id → session_id` 落盘，重启不丢上下文；`/new` 清空
-- 长结果自动分片，超出上限截断并提示
-- 飞书事件重推按 message_id 去重
+**推荐把 `bridge` 和 `remote_agent_server.py` 都部署在服务器上。服务器主动连接飞书，飞书通过已建立的长连接下发消息；你的电脑只需要使用飞书。**
 
----
-
-## 一、先在本地跑通链路（不碰飞书，2 分钟）
-
-```bash
-python3 -m pip install -r requirements.txt
-
-# 终端 A：假的远端 agent，只回显，不调模型
-python3 remote_agent_server.py --dry-run --port 8787 --token test-token
-
-# 终端 B：把模拟事件喂给桥接服务
-AGENT_URL=http://127.0.0.1:8787/task AGENT_TOKEN=test-token python3 -m bridge.app --mock
+```mermaid
+flowchart LR
+    User["你的飞书：@机器人"] --> Cloud["飞书云端"]
+    Cloud -->|"沿长连接下发任务"| Bridge
+    Bridge -->|"主动建立长连接 / 回传结果"| Cloud
+    Cloud -->|"回复结果"| User
+    subgraph Server["远端服务器"]
+        Bridge["bridge：接收消息"]
+        Bridge -->|"127.0.0.1:8787"| Agent["agent 执行服务"]
+        Agent -->|"执行结果"| Bridge
+    end
 ```
 
-在终端 B 逐行贴（每行一个 JSON，Ctrl-D 结束）：
+## 一、选择部署教程
 
-```json
-{"text":"帮我跑一下并发测试，整理成一句话总结"}
-{"text":"/new"}
-{"text":"只看 p99 延迟"}
-{"text":"我是路人","open_id":"ou_stranger"}
-```
+本节目的：区分本机验证与服务器常驻运行，避免把任务发到错误的机器。
 
-期望：第一条回「收到，已转给远端 agent…」，1 秒后回「任务完成（1.0s）」；`/new` 回「已开新会话」；路人回「你还没有权限（open_id: ou_stranger）」。
-
-跑单测：`python3 -m unittest discover -s tests`（23 个用例，覆盖解析、分片、鉴权、去重、并发、失败回传）。
-
----
-
-## 二、建飞书应用（这步错后面全白费）
-
-1. 开放平台 → 创建企业自建应用 → 记下 **App ID / App Secret**（凭证与基础信息）
-2. 添加应用能力 → **机器人**
-3. 权限管理 → 开通下面这些（搜索 `im:message` 一把勾上）：
-   - 以应用身份发消息
-   - 接收单聊消息（`im:message.p2p_msg`）
-   - **接收群聊中 @ 机器人 的消息**（`im:message.group_at_msg`）← 群聊没这个就不回话
-   - 可选：读取群信息、上传图片/文件
-4. 事件与回调 → 事件订阅 → **订阅方式选「使用长连接接收事件」** → 添加事件 **接收消息 `im.message.receive_v1`**
-   - 长连接模式下「请求地址 / Encrypt Key / Verification Token」都不用填
-5. 版本管理与发布 → 创建版本 → 申请发布 → 等管理员审核通过（**权限和事件在发布后才生效**）
-6. 把机器人拉进群，或直接单聊
-
-拿到自己的 open_id：先把 `ALLOW_OPEN_IDS` 留空启动，在群里 @ 一次机器人，日志里会打印
-`未授权用户 open_id=ou_xxx`，把它填进 `.env` 再重启即可。
-
----
-
-## 三、部署飞书侧
-
-```bash
-cp .env.example .env
-vi .env          # 填 FEISHU_APP_ID / FEISHU_APP_SECRET / ALLOW_OPEN_IDS / AGENT_URL / AGENT_TOKEN
-python3 -m bridge.app
-```
-
-`.env` 里几个关键项：
-
-| 变量 | 说明 |
-|---|---|
-| `ALLOW_OPEN_IDS` | 谁能指挥这台机器，逗号分隔；**留空 = 拒绝所有人** |
-| `ALLOW_CHAT_IDS` | 允许的会话，留空不限制 |
-| `AGENT_TRANSPORT` | `http`（推荐）/ `ssh` / `local` |
-| `AGENT_URL` / `AGENT_TOKEN` | http 模式下远端接口和令牌 |
-| `SSH_TARGET` / `SSH_COMMAND` | ssh 模式：`root@1.2.3.4` + `claude -p --output-format text` |
-| `AGENT_TIMEOUT` | 单任务超时，默认 900s |
-| `WORKERS` | 跨会话并行数 |
-| `MAX_CHUNK_CHARS` / `MAX_CHUNKS` | 单条消息上限与最多条数 |
-
-常驻（systemd，见 `deploy/lark-bridge.service`）：
-
-```bash
-sudo cp deploy/lark-bridge.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now lark-bridge
-journalctl -u lark-bridge -f
-```
-
----
-
-## 四、部署远端（Claude 那台机器）
-
-```bash
-# 自测
-python3 remote_agent_server.py --dry-run --port 8787 --token <TOKEN>
-
-# 正式：--workdir 决定 Claude 在哪个仓库里干活
-python3 remote_agent_server.py --port 8787 --token <TOKEN> \
-    --workdir /srv/repo \
-    --command "claude -p --output-format json"
-```
-
-接口：
-
-```
-POST /task   Authorization: Bearer <TOKEN>
-{"text": "...", "session_id": "可选", "meta": {...}}
-→ {"reply": "...", "session_id": "uuid", "elapsed": 12.3}
-
-GET /health → {"ok": true}
-```
-
-**安全要点**：不要 `--host 0.0.0.0` 裸奔在公网。两种稳妥做法：
-
-1. 只监听 `127.0.0.1`，用 SSH 隧道从桥接机上打通：`ssh -L 8787:127.0.0.1:8787 user@server -N`
-2. 必须跨机时，只开安全组给桥接机 IP，并一定设 `--token`
-
-Claude 命令不用 `--resume` 之外的花活：桥接侧把 `session_id` 传回来，服务端自动拼 `--resume <id>`，所以同一个飞书会话能连续对话。
-
----
-
-## 五、飞书里怎么用
-
-| 你发 | 效果 |
-|---|---|
-| `@机器人 把昨天的测试日志整理成结论` | 转给远端，跑完回结果 |
-| `@机器人 /new` | 丢掉上下文，从新会话开始 |
-| `@机器人 /status` | 看后端类型、当前 session、是否在跑 |
-| `@机器人 /ping` | 确认机器人活着 |
-| `@机器人 /help` | 用法说明 |
-
-并发规则：同一个群同一时间只跑一个任务（第二次会回「上一个任务还在跑」），不同群/单聊并行。
-
----
-
-## 六、排错对照
-
-| 现象 | 原因 | 处理 |
+| 场景 | 在哪里运行代码 | 教程 |
 |---|---|---|
-| 日志里完全没有事件 | 长连接没建立 / 事件没订阅 / 版本没发布 | 看启动日志有没有「长连接启动中」；开放平台确认 `im.message.receive_v1` 已订阅且版本已过审 |
-| 群聊 @ 了不回 | 缺 `im:message.group_at_msg` | 补权限后重新发版 |
-| 单聊不回 | 缺 `im:message.p2p_msg` | 同上 |
-| 回「你还没有权限」 | open_id 不在白名单 | 把日志里的 open_id 填进 `ALLOW_OPEN_IDS` |
-| 报 `code=99991672` / `230027` | 权限不足或被管理员限制 | 开放平台补权限、申请审核 |
-| 报 `code=230002` | 机器人不在该会话 | 把机器人拉进群 |
-| 一直「任务完成」但内容是空的 | 远端返回格式不对 | 远端要返回 `{"reply": "..."}` |
-| 「连不上远端 agent」 | URL/端口/防火墙 | `curl <AGENT_URL> -H 'Authorization: Bearer ...'` 自测 |
-| 「远端 agent 鉴权失败」 | `AGENT_TOKEN` 两边不一致 | 对齐 token |
-| 结果只出来一截 | 消息超长 | 调小 `MAX_CHUNK_CHARS`，或让远端把长结果写成文档发链接 |
-| 任务跑一半被新消息顶掉 | 同会话串行 | 等它出结果，或先 `/new` |
+| 先验证解析、转发和回传 | 本机，使用模拟消息与模拟 agent | [本机部署与联调](deploy/local.md) |
+| 临时验证真实飞书机器人 | 本机，任务也在本机执行 | [本机连接真实飞书](deploy/local.md#四可选连接真实飞书) |
+| 通过飞书控制不同网络的服务器 | 两个服务都在服务器，本机只使用飞书 | [服务端部署](deploy/server.md) |
 
----
+跨网络部署不需要本机 SSH 到服务器，也不需要开放服务器的入站端口。服务器需要能主动访问飞书 API、飞书长连接服务，以及 agent 使用的模型服务。首次安装可以通过服务器网页终端、云平台控制台或平台提供的文件上传功能完成。
 
-## 七、安全清单（上线前逐条确认）
+## 二、机器人与飞书配置
 
-- [ ] `ALLOW_OPEN_IDS` 只放自己（和可信的人），**别留空**
-- [ ] 远端服务只监听内网 / 走 SSH 隧道，`--token` 必设且随机
-- [ ] 远端 agent 用独立账号或容器跑，不要 root，不要挂生产凭证
-- [ ] `--workdir` 指到专用仓库，避免它在系统目录乱改
-- [ ] 定期看日志里有没有陌生的 open_id 尝试
+本节目的：让接收消息和发送结果使用同一个应用机器人。
 
----
+已有“**wusi的飞书 CLI**”时，复用该应用即可，App ID 为 `cli_aa9c105a7678dbdb`。App Secret 在飞书开放平台的“凭证与基础信息”中获取，填入部署机器的 `.env`。
 
-## 八、文件说明
+本项目通过 `lark-oapi` SDK 连接飞书，读取 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`。飞书 CLI 的 `profile use wusi`、用户登录态和本项目的运行配置相互独立；机器人运行使用应用凭证，不要求用户 OAuth 登录。
+
+在该应用的飞书开放平台后台确认：
+
+1. 已启用机器人能力。
+2. 已开通以应用身份发送消息 `im:message:send_as_bot`、接收单聊消息 `im:message.p2p_msg:readonly`、接收群聊中 @ 机器人的消息 `im:message.group_at_msg:readonly`。
+3. “事件与回调”的订阅方式为“使用长连接接收事件”，添加 `im.message.receive_v1`。
+4. 应用版本已发布，新增权限和事件已生效；使用者在应用可用范围内。
+5. 已把“wusi的飞书 CLI”拉入目标群，或打开与机器人的单聊。
+
+SDK 启动成功后，前台日志应出现长连接相关日志。只看到“长连接启动中”这一行还不能证明连接已建立，继续观察 SDK 的连接结果。
+
+`ALLOW_OPEN_IDS` 使用这个应用下的用户 `open_id`。不同应用下的 `open_id` 可能不同，不要直接复制其他应用的用户 ID。首次可留空启动，再 @ 一次机器人；从“未授权用户 open_id=...”日志或拒绝回复中取得 ID，填入 `.env` 后重启。
+
+## 三、关键配置
+
+本节目的：说明两项服务之间的接口，以及配置由谁读取。
+
+| 配置 | 用途 |
+|---|---|
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | `bridge` 连接飞书的应用凭证 |
+| `BOT_OPEN_ID` | 可选；未填写时 `bridge` 调用接口获取机器人自身 ID |
+| `ALLOW_OPEN_IDS` | 可执行任务的用户，逗号分隔；留空拒绝所有人 |
+| `ALLOW_CHAT_IDS` | 可选的群/会话白名单；留空不限制 |
+| `AGENT_TRANSPORT=http` | 教程推荐的执行后端 |
+| `AGENT_URL=http://127.0.0.1:8787/task` | 同一台机器上的 agent 执行服务 |
+| `AGENT_TOKEN` | 两项服务共用的接口令牌 |
+| `CLAUDE_COMMAND` / `CLAUDE_WORKDIR` | agent 服务的命令与任务工作目录 |
+| `AGENT_TIMEOUT` | `bridge` 等待 agent 的超时；默认 900 秒 |
+| `WORKERS` | 不同会话的任务线程数 |
+| `STATE_DIR` | `bridge` 的会话映射保存目录 |
+
+`bridge` 自动读取 `.env`；`remote_agent_server.py` 读取进程环境变量，**不会自动读取 `.env`**。教程中的前台启动会先加载 `.env`，systemd 模板则使用 `EnvironmentFile` 加载同一份文件。
+
+## 四、在飞书中使用
+
+本节目的：说明部署完成后如何触发任务并查看状态。
+
+| 消息 | 效果 |
+|---|---|
+| `@机器人 /ping` | 确认消息已到达桥接进程 |
+| `@机器人 /status` | 查看后端、会话 ID 与运行状态 |
+| `@机器人 请只输出当前工作目录` | 验证 agent 确实运行在指定机器与目录 |
+| `@机器人 /new` | 清除后续任务使用的会话上下文；不停止正在执行的任务 |
+| `@机器人 /help` | 查看指令说明 |
+
+单聊直接发送任务即可。群聊必须 @ 目标机器人。`/ping` 只检查桥接进程，不能证明模型和 agent 执行正常；再发送一个简单任务验证完整链路。
+
+## 五、现有行为与边界
+
+本节目的：说明当前代码实际支持的行为，避免把教程当成尚未实现的保证。
+
+- 文本与富文本任务经过白名单检查后交给后台线程执行，结果自动分片回传。
+- HTTP 示例针对 Claude Code：命令从 stdin 接收任务，JSON 输出中的 `session_id` 用于下一次 `--resume`。
+- SSH/本地命令后端可执行单次任务，但当前没有将已有会话 ID 加入执行命令；教程使用 HTTP 后端完成续会话。
+- 去重记录位于内存，默认保留 900 秒；进程重启后不保留。会话映射保存到 `STATE_DIR/sessions.json`。
+- 消息回调目前会同步发送“收到”等回复，慢网络会延长回调时间；不保证固定时间内 ACK。
+- 同会话忙碌检查与占用不是原子操作，并发调用时可能同时提交任务。现阶段每个机器人只运行一个桥接实例，任务按次发送并等待完成。
+- Claude Code 的实际工具权限、登录或模型网关配置需要在服务运行用户下完成。非交互模式无法现场回答权限确认，先按任务范围配置并验证权限。
+
+## 六、文件说明
+
+本节目的：定位教程、配置模板和消息执行链路的源码。
 
 | 文件 | 作用 |
 |---|---|
-| `bridge/app.py` | 入口：长连接收事件；`--mock` 离线联调 |
-| `bridge/dispatch.py` | 鉴权、去重、指令、单会话串行、异步执行、结果回发 |
-| `bridge/feishu.py` | token 缓存、回复/发送、分片、错误码提示 |
-| `bridge/agent.py` | 三种后端：HTTP / SSH / 本地命令；会话落盘 |
-| `bridge/text.py` | 纯函数：@ 剥离、富文本提取、分片、指令解析 |
-| `remote_agent_server.py` | 服务器侧：把 `claude -p` 包成 HTTP，带 session 续接 |
-| `tests/test_core.py` | 离线单测 |
-| `deploy/*.service` | systemd 单元 |
-
-想改行为基本只动 `.env`，代码不用碰。
+| [deploy/local.md](deploy/local.md) | 本机环境准备、离线联调与真实机器人验证 |
+| [deploy/server.md](deploy/server.md) | 不同网络的服务器部署、systemd 自启、排错与更新 |
+| [.env.example](.env.example) | 应用、白名单与 agent 配置示例 |
+| `bridge/app.py` | SDK 长连接入口与模拟消息入口 |
+| `bridge/dispatch.py` | 鉴权、去重、指令处理与任务分发 |
+| `bridge/feishu.py` | 飞书消息回复与分片发送 |
+| `bridge/agent.py` | HTTP/SSH/本地命令调用与会话保存 |
+| `remote_agent_server.py` | 将 agent CLI 包装成 HTTP 接口 |
+| `deploy/*.service` | 读取 `.env`、使用虚拟环境的 systemd 模板 |
+| `tests/test_core.py` | 23 个离线单元测试 |
